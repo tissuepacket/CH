@@ -5,7 +5,7 @@ from pathlib import Path
 import sqlite3
 import threading
 import time
-from urllib import parse, request
+from urllib import parse, request as urllib_request
 
 from flask import Flask, jsonify, redirect, render_template, request, url_for
 
@@ -203,7 +203,7 @@ def telegram_call(method, values=None):
     endpoint = f"https://api.telegram.org/bot{token}/{method}"
     payload = parse.urlencode(values or {}).encode()
     try:
-        with request.urlopen(request.Request(endpoint, data=payload), timeout=35) as response:
+        with urllib_request.urlopen(urllib_request.Request(endpoint, data=payload), timeout=35) as response:
             return json.loads(response.read().decode())
     except Exception:
         return None
