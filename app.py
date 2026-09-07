@@ -209,8 +209,39 @@ def telegram_call(method, values=None):
         return None
 
 
-def telegram_send(chat_id, text):
-    telegram_call("sendMessage", {"chat_id": chat_id, "text": text})
+def telegram_send(chat_id, text, keyboard=None, remove_keyboard=False):
+    values = {"chat_id": chat_id, "text": text}
+    if remove_keyboard:
+        values["reply_markup"] = json.dumps({"remove_keyboard": True})
+    elif keyboard:
+        values["reply_markup"] = json.dumps(
+            {"keyboard": keyboard, "resize_keyboard": True, "one_time_keyboard": True}
+        )
+    telegram_call("sendMessage", values)
+
+
+def telegram_section_keyboard():
+    return [["Timetable", "Exams"], ["Important events", "Reminder notes"]]
+
+
+def telegram_yes_no_keyboard():
+    return [["Yes", "No"]]
+
+
+def telegram_time_keyboard(include_no_time=False):
+    slots = [f"{hour:02d}:{minute:02d}" for hour in range(24) for minute in (0, 30)]
+    keyboard = [slots[index:index + 4] for index in range(0, len(slots), 4)]
+    if include_no_time:
+        keyboard.append(["No specific time"])
+    return keyboard
+
+
+def telegram_count_keyboard():
+    return [["1", "2", "3", "4", "5"], ["10", "20", "50", "100"]]
+
+
+def telegram_interval_keyboard():
+    return [["30 minutes", "1 hour"], ["2 hours", "1 day"], ["1 week"]]
 
 
 def get_telegram_draft(chat_id):
@@ -279,6 +310,7 @@ def telegram_section(text):
         "important events": "events",
         "reminders": "reminders",
         "reminder": "reminders",
+        "reminder notes": "reminders",
     }
     return options.get(text.strip().lower())
 
@@ -294,6 +326,7 @@ def finish_telegram_entry(chat_id, payload):
         f"Saved in {SECTIONS[payload['section']]['label']}: {payload['title']}\n"
         f"Date: {payload['entry_date']}\nTime: {payload['entry_time'] or 'not set'}{schedule}\n\n"
         "Send /new to add another entry.",
+        remove_keyboard=True,
     )
 
 
@@ -302,13 +335,14 @@ def handle_telegram_message(chat_id, text):
     command = text.split()[0].lower().split("@", 1)[0] if text else ""
     if command in {"/cancel", "/stop"}:
         clear_telegram_draft(chat_id)
-        telegram_send(chat_id, "Cancelled. Send /new whenever you want to add an entry.")
+        telegram_send(chat_id, "Cancelled. Send /new whenever you want to add an entry.", remove_keyboard=True)
         return
-    if command in {"/start", "/new"}:
+    if command in {"/start", "/new", "new"}:
         set_telegram_draft(chat_id, "section", {})
         telegram_send(
             chat_id,
-            "Daymark is ready. Where should I put this? Reply with timetable, exams, events, or reminders.\n\nSend /cancel to stop.",
+            "Daymark is ready. Choose a section.\n\nSend /cancel to stop.",
+            telegram_section_keyboard(),
         )
         return
 
@@ -357,32 +391,63 @@ def handle_telegram_message(chat_id, text):
             return
         payload["entry_date"] = text
         set_telegram_draft(chat_id, "time", payload)
-        telegram_send(chat_id, "What time? Use HH:MM, for example 18:30. Reply skip if there is no specific time.")
+        telegram_send(
+            chat_id,
+            "Choose a time. Scroll through the buttons to find the 30-minute slot you want.",
+            telegram_time_keyboard(payload["section"] != "reminders"),
+        )
         return
     if state == "time":
-        if text.lower() != "skip":
+        if text.lower() == "no specific time":
+            payload["entry_time"] = ""
+        else:
             try:
                 datetime.strptime(text, "%H:%M")
             except ValueError:
-                telegram_send(chat_id, "Please use HH:MM, for example 18:30, or reply skip.")
+                telegram_send(chat_id, "Please choose one of the time buttons.", telegram_time_keyboard(payload["section"] != "reminders"))
                 return
             payload["entry_time"] = text
         if payload["section"] == "reminders" and not payload["entry_time"]:
-            telegram_send(chat_id, "Reminders need a time. Please send it as HH:MM, for example 18:30.")
+            telegram_send(chat_id, "Reminder notes need a time. Please choose a time button.", telegram_time_keyboard())
             return
-        set_telegram_draft(chat_id, "location", payload)
-        telegram_send(chat_id, "Where is it? Send a location, or reply skip.")
+        set_telegram_draft(chat_id, "location_choice", payload)
+        telegram_send(chat_id, "Does it have a location?", telegram_yes_no_keyboard())
+        return
+    if state == "location_choice":
+        if text.lower() == "yes":
+            set_telegram_draft(chat_id, "location", payload)
+            telegram_send(chat_id, "Type the location.")
+        elif text.lower() == "no":
+            payload["location"] = ""
+            set_telegram_draft(chat_id, "notes_choice", payload)
+            telegram_send(chat_id, "Does it have notes?", telegram_yes_no_keyboard())
+        else:
+            telegram_send(chat_id, "Please press Yes or No.", telegram_yes_no_keyboard())
         return
     if state == "location":
-        payload["location"] = "" if text.lower() == "skip" else text
-        set_telegram_draft(chat_id, "notes", payload)
-        telegram_send(chat_id, "Any notes? Send them, or reply skip.")
+        payload["location"] = text
+        set_telegram_draft(chat_id, "notes_choice", payload)
+        telegram_send(chat_id, "Does it have notes?", telegram_yes_no_keyboard())
+        return
+    if state == "notes_choice":
+        if text.lower() == "yes":
+            set_telegram_draft(chat_id, "notes", payload)
+            telegram_send(chat_id, "Type the notes.")
+        elif text.lower() == "no":
+            payload["notes"] = ""
+            if payload["section"] == "reminders":
+                set_telegram_draft(chat_id, "reminder_count", payload)
+                telegram_send(chat_id, "How many reminders? Choose a number.", telegram_count_keyboard())
+            else:
+                finish_telegram_entry(chat_id, payload)
+        else:
+            telegram_send(chat_id, "Please press Yes or No.", telegram_yes_no_keyboard())
         return
     if state == "notes":
-        payload["notes"] = "" if text.lower() == "skip" else text
+        payload["notes"] = text
         if payload["section"] == "reminders":
             set_telegram_draft(chat_id, "reminder_count", payload)
-            telegram_send(chat_id, "How many reminders should I send? Reply with a number from 1 to 100.")
+            telegram_send(chat_id, "How many reminders? Choose a number.", telegram_count_keyboard())
         else:
             finish_telegram_entry(chat_id, payload)
         return
@@ -396,7 +461,7 @@ def handle_telegram_message(chat_id, text):
             return
         payload["reminder_count"] = count
         set_telegram_draft(chat_id, "reminder_interval", payload)
-        telegram_send(chat_id, "How often? Reply like 30 minutes, 2 hours, 1 day, or 1 week.")
+        telegram_send(chat_id, "How often? Choose an interval.", telegram_interval_keyboard())
         return
     if state == "reminder_interval":
         parts = text.lower().split()
