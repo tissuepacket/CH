@@ -1,13 +1,23 @@
-from datetime import datetime
+from datetime import datetime, time as datetime_time, timedelta
 import json
 import os
 from pathlib import Path
+import re
+import ssl
 import sqlite3
 import threading
 import time
-from urllib import parse, request
+from urllib import parse, request as urllib_request
 
-from flask import Flask, jsonify, redirect, render_template, request, url_for
+from flask import Flask, Response, jsonify, redirect, render_template, request, url_for
+
+from calendar_import.export_calendar import (
+    CalendarExportError,
+    DEFAULT_DURATION_MINUTES,
+    DEFAULT_TIMEZONE,
+    build_calendar,
+    load_entries,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE = BASE_DIR / "life_admin.db"
@@ -21,6 +31,10 @@ SECTIONS = {
     "events": {"label": "Important events", "icon": "◆", "color": "teal"},
     "reminders": {"label": "Reminder notes", "icon": "!", "color": "gold"},
 }
+
+DEFAULT_ENTRY_DURATION_MINUTES = 60
+TIME_TOKEN_PATTERN = r"\d{1,2}(?::\d{2})?\s*(?:[AaPp][Mm])?"
+_telegram_ssl_context = None
 
 
 def get_db():
@@ -39,6 +53,7 @@ def init_db():
                 title TEXT NOT NULL,
                 entry_date TEXT NOT NULL,
                 entry_time TEXT,
+                entry_end_time TEXT,
                 location TEXT,
                 notes TEXT,
                 reminder_count INTEGER NOT NULL DEFAULT 1,
@@ -59,6 +74,7 @@ def init_db():
         )
         columns = {row[1] for row in connection.execute("PRAGMA table_info(entries)")}
         migrations = {
+            "entry_end_time": "ALTER TABLE entries ADD COLUMN entry_end_time TEXT",
             "reminder_count": "ALTER TABLE entries ADD COLUMN reminder_count INTEGER NOT NULL DEFAULT 1",
             "reminder_interval": "ALTER TABLE entries ADD COLUMN reminder_interval INTEGER NOT NULL DEFAULT 0",
             "reminder_interval_unit": "ALTER TABLE entries ADD COLUMN reminder_interval_unit TEXT NOT NULL DEFAULT 'hours'",
@@ -80,6 +96,9 @@ def format_entry(entry):
         item["display_date"] = "No date"
     item["section_label"] = SECTIONS[item["section"]]["label"]
     item["section_color"] = SECTIONS[item["section"]]["color"]
+    item["display_time"] = item["entry_time"] or ""
+    if item["entry_time"] and item["entry_end_time"]:
+        item["display_time"] = f"{item['entry_time']}–{item['entry_end_time']}"
     item["is_complete"] = is_reminder_complete(item)
     if item["section"] == "reminders" and item["reminder_interval"]:
         count_label = "reminder" if item["reminder_count"] == 1 else "reminders"
@@ -156,6 +175,7 @@ def create_entry():
             "title": title,
             "entry_date": request.form.get("entry_date", ""),
             "entry_time": request.form.get("entry_time", ""),
+            "entry_end_time": request.form.get("entry_end_time", ""),
             "location": request.form.get("location", "").strip(),
             "notes": request.form.get("notes", "").strip(),
             "reminder_count": reminder_count,
@@ -183,6 +203,19 @@ def api_entries():
     return jsonify([format_entry(row) for row in rows])
 
 
+@app.get("/calendar.ics")
+def download_calendar():
+    try:
+        entries = load_entries(DATABASE)
+        calendar = build_calendar(entries, DEFAULT_TIMEZONE, DEFAULT_DURATION_MINUTES)
+    except (CalendarExportError, OSError) as error:
+        return jsonify({"error": f"Calendar export failed: {error}"}), 500
+
+    response = Response(calendar, mimetype="text/calendar")
+    response.headers["Content-Disposition"] = 'attachment; filename="daymark_calendar.ics"'
+    return response
+
+
 def get_telegram_token():
     try:
         for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
@@ -196,6 +229,39 @@ def get_telegram_token():
     return os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 
 
+def get_telegram_ssl_context():
+    """Use Windows' trusted roots when the bundled Python roots are incomplete."""
+
+    global _telegram_ssl_context
+    if _telegram_ssl_context is not None:
+        return _telegram_ssl_context
+
+    if os.name == "nt":
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = True
+            context.verify_mode = ssl.CERT_REQUIRED
+            loaded = 0
+            for certificate, encoding, _trust in ssl.enum_certificates("ROOT"):
+                if encoding != "x509_asn":
+                    continue
+                try:
+                    context.load_verify_locations(
+                        cadata=ssl.DER_cert_to_PEM_cert(certificate)
+                    )
+                    loaded += 1
+                except ssl.SSLError:
+                    continue
+            if loaded:
+                _telegram_ssl_context = context
+                return _telegram_ssl_context
+        except (AttributeError, OSError, ssl.SSLError):
+            pass
+
+    _telegram_ssl_context = ssl.create_default_context()
+    return _telegram_ssl_context
+
+
 def telegram_call(method, values=None):
     token = get_telegram_token()
     if not token:
@@ -203,14 +269,102 @@ def telegram_call(method, values=None):
     endpoint = f"https://api.telegram.org/bot{token}/{method}"
     payload = parse.urlencode(values or {}).encode()
     try:
-        with request.urlopen(request.Request(endpoint, data=payload), timeout=35) as response:
+        with urllib_request.urlopen(
+            urllib_request.Request(endpoint, data=payload),
+            timeout=35,
+            context=get_telegram_ssl_context(),
+        ) as response:
             return json.loads(response.read().decode())
-    except Exception:
+    except Exception as error:
+        print(f"Telegram {method} failed: {error}", flush=True)
         return None
 
 
 def telegram_send(chat_id, text):
     telegram_call("sendMessage", {"chat_id": chat_id, "text": text})
+
+
+def telegram_send_document(chat_id, content, filename, caption=""):
+    """Send an in-memory file to Telegram using the Bot API multipart format."""
+
+    token = get_telegram_token()
+    if not token:
+        return False
+
+    boundary = f"----DaymarkBoundary{int(time.time() * 1000)}"
+    boundary_bytes = boundary.encode("ascii")
+    parts = [
+        b"--" + boundary_bytes + b"\r\n"
+        b'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+        + str(chat_id).encode("utf-8")
+        + b"\r\n"
+    ]
+    if caption:
+        parts.extend(
+            [
+                b"--" + boundary_bytes + b"\r\n"
+                b'Content-Disposition: form-data; name="caption"\r\n\r\n'
+                + caption.encode("utf-8")
+                + b"\r\n"
+            ]
+        )
+    parts.extend(
+        [
+            b"--" + boundary_bytes + b"\r\n"
+            + f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'.encode(
+                "utf-8"
+            )
+            + b"Content-Type: text/calendar\r\n\r\n"
+            + content
+            + b"\r\n",
+            b"--" + boundary_bytes + b"--\r\n",
+        ]
+    )
+
+    endpoint = f"https://api.telegram.org/bot{token}/sendDocument"
+    try:
+        with urllib_request.urlopen(
+            urllib_request.Request(
+                endpoint,
+                data=b"".join(parts),
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+            ),
+            timeout=35,
+            context=get_telegram_ssl_context(),
+        ) as response:
+            result = json.loads(response.read().decode())
+            return bool(result.get("ok"))
+    except Exception as error:
+        print(f"Telegram sendDocument failed: {error}", flush=True)
+        return False
+
+
+def telegram_export_calendar(chat_id):
+    """Build the current Daymark snapshot and send it to the requesting chat."""
+
+    try:
+        entries = load_entries(DATABASE)
+        if not entries:
+            telegram_send(chat_id, "There are no Daymark entries to export yet.")
+            return
+        calendar = build_calendar(entries, DEFAULT_TIMEZONE, DEFAULT_DURATION_MINUTES)
+    except (CalendarExportError, OSError) as error:
+        telegram_send(chat_id, f"Calendar export failed: {error}")
+        return
+
+    sent = telegram_send_document(
+        chat_id,
+        calendar.encode("utf-8"),
+        "daymark_calendar.ics",
+        caption=(
+            f"Daymark export: {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}. "
+            "Import this .ics file into Google Calendar."
+        ),
+    )
+    if not sent:
+        telegram_send(chat_id, "I could not send the calendar file. Please try /export again.")
 
 
 def get_telegram_draft(chat_id):
@@ -247,15 +401,16 @@ def save_entry(entry):
     with get_db() as connection:
         cursor = connection.execute(
             """
-            INSERT INTO entries (section, title, entry_date, entry_time, location, notes,
+            INSERT INTO entries (section, title, entry_date, entry_time, entry_end_time, location, notes,
                                  reminder_count, reminder_interval, reminder_interval_unit, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry["section"],
                 entry["title"],
                 entry["entry_date"],
                 entry["entry_time"],
+                entry.get("entry_end_time", ""),
                 entry["location"],
                 entry["notes"],
                 entry["reminder_count"],
@@ -283,16 +438,162 @@ def telegram_section(text):
     return options.get(text.strip().lower())
 
 
-def finish_telegram_entry(chat_id, payload):
+def parse_time_token(value, meridiem_hint=None):
+    value = value.strip().lower().replace(" ", "")
+    match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?(am|pm)?", value)
+    if not match:
+        raise ValueError
+
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = match.group(3) or meridiem_hint
+    if not 0 <= minute <= 59:
+        raise ValueError
+    if meridiem:
+        if not 1 <= hour <= 12:
+            raise ValueError
+        if meridiem == "am":
+            hour = 0 if hour == 12 else hour
+        else:
+            hour = 12 if hour == 12 else hour + 12
+    elif not 0 <= hour <= 23:
+        raise ValueError
+    return datetime_time(hour, minute)
+
+
+def time_meridiem(value):
+    match = re.search(r"(am|pm)\s*$", value.strip(), re.IGNORECASE)
+    return match.group(1).lower() if match else None
+
+
+def parse_telegram_time_window(text):
+    """Return HH:MM start/end values; a single time means a one-hour block."""
+
+    normalized = text.strip().replace("–", "-").replace("—", "-")
+    range_match = re.fullmatch(
+        rf"({TIME_TOKEN_PATTERN})\s*-\s*({TIME_TOKEN_PATTERN})", normalized
+    )
+    if range_match:
+        raw_start, raw_end = range_match.groups()
+        start_meridiem = time_meridiem(raw_start)
+        end_meridiem = time_meridiem(raw_end)
+        start = parse_time_token(raw_start, end_meridiem if not start_meridiem else None)
+        end = parse_time_token(raw_end, start_meridiem if not end_meridiem else None)
+        if end <= start:
+            raise ValueError
+    else:
+        start = parse_time_token(normalized)
+        end = (
+            datetime.combine(datetime.today(), start)
+            + timedelta(minutes=DEFAULT_ENTRY_DURATION_MINUTES)
+        ).time()
+
+    return start.strftime("%H:%M"), end.strftime("%H:%M")
+
+
+def entry_value(entry, key, default=""):
+    try:
+        value = entry[key]
+    except (IndexError, KeyError):
+        return default
+    return default if value is None else value
+
+
+def entry_window(entry):
+    entry_date = entry_value(entry, "entry_date")
+    entry_time = entry_value(entry, "entry_time")
+    if not entry_date or not entry_time:
+        return None
+
+    start = datetime.strptime(f"{entry_date}T{entry_time}", "%Y-%m-%dT%H:%M")
+    end_time = entry_value(entry, "entry_end_time")
+    if end_time:
+        end = datetime.strptime(f"{entry_date}T{end_time}", "%Y-%m-%dT%H:%M")
+    else:
+        end = start + timedelta(minutes=DEFAULT_ENTRY_DURATION_MINUTES)
+    if end <= start:
+        return None
+    return start, end
+
+
+def find_schedule_conflicts(candidate):
+    candidate_window = entry_window(candidate)
+    if not candidate_window:
+        return []
+
+    candidate_id = entry_value(candidate, "id")
+    with get_db() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, section, title, entry_date, entry_time, entry_end_time
+            FROM entries
+            WHERE entry_date = ? AND entry_time != ''
+            ORDER BY entry_time, id
+            """,
+            (entry_value(candidate, "entry_date"),),
+        ).fetchall()
+
+    conflicts = []
+    candidate_start, candidate_end = candidate_window
+    for row in rows:
+        if candidate_id and str(row["id"]) == str(candidate_id):
+            continue
+        other_window = entry_window(row)
+        if not other_window:
+            continue
+        other_start, other_end = other_window
+        if candidate_start < other_end and other_start < candidate_end:
+            conflicts.append(
+                {
+                    "title": row["title"],
+                    "section": SECTIONS[row["section"]]["label"],
+                    "start": other_start.strftime("%H:%M"),
+                    "end": other_end.strftime("%H:%M"),
+                }
+            )
+    return conflicts
+
+
+def finish_telegram_entry(chat_id, payload, confirmed=False):
+    if not confirmed:
+        conflicts = find_schedule_conflicts(payload)
+        if conflicts:
+            entry_end_time = payload.get("entry_end_time", "")
+            new_time = payload["entry_time"]
+            if entry_end_time:
+                new_time = f"{new_time}-{entry_end_time}"
+            conflict_date = datetime.strptime(
+                payload["entry_date"], "%Y-%m-%d"
+            ).strftime("%A, %d %B %Y")
+            conflict_lines = "\n".join(
+                f"  • {item['title']} [{item['section']}] — {item['start']}-{item['end']}"
+                for item in conflicts
+            )
+            set_telegram_draft(chat_id, "conflict_confirmation", payload)
+            telegram_send(
+                chat_id,
+                "⚠️ SCHEDULE CONFLICT — NOT SAVED YET ⚠️\n\n"
+                f"New entry: {payload['title']}\n"
+                f"Date: {conflict_date}\n"
+                f"Time: {new_time}\n\n"
+                "Overlaps with:\n"
+                f"{conflict_lines}\n\n"
+                "Reply YES to save anyway, or NO to cancel.",
+            )
+            return
+
     save_entry(payload)
     clear_telegram_draft(chat_id)
     schedule = ""
     if payload["section"] == "reminders":
         schedule = f"\nSchedule: {payload['reminder_count']} reminder(s) every {payload['reminder_interval']} {payload['reminder_interval_unit']}"
+    time_display = payload["entry_time"] or "not set"
+    if payload.get("entry_end_time"):
+        time_display = f"{payload['entry_time']}-{payload['entry_end_time']}"
     telegram_send(
         chat_id,
         f"Saved in {SECTIONS[payload['section']]['label']}: {payload['title']}\n"
-        f"Date: {payload['entry_date']}\nTime: {payload['entry_time'] or 'not set'}{schedule}\n\n"
+        f"Date: {payload['entry_date']}\nTime: {time_display}{schedule}\n\n"
         "Send /new to add another entry.",
     )
 
@@ -300,6 +601,18 @@ def finish_telegram_entry(chat_id, payload):
 def handle_telegram_message(chat_id, text):
     text = text.strip()
     command = text.split()[0].lower().split("@", 1)[0] if text else ""
+    if command in {"/export", "/calendar"}:
+        telegram_export_calendar(chat_id)
+        return
+    if command == "/help":
+        telegram_send(
+            chat_id,
+            "Daymark commands:\n"
+            "/new - add a task\n"
+            "/export - receive the current calendar file for Google Calendar\n"
+            "/cancel - cancel the current entry",
+        )
+        return
     if command in {"/cancel", "/stop"}:
         clear_telegram_draft(chat_id)
         telegram_send(chat_id, "Cancelled. Send /new whenever you want to add an entry.")
@@ -308,7 +621,8 @@ def handle_telegram_message(chat_id, text):
         set_telegram_draft(chat_id, "section", {})
         telegram_send(
             chat_id,
-            "Daymark is ready. Where should I put this? Reply with timetable, exams, events, or reminders.\n\nSend /cancel to stop.",
+            "Daymark is ready. Where should I put this? Reply with timetable, exams, events, or reminders.\n\n"
+            "Send /cancel to stop, /export to receive your calendar file, or /help for commands.",
         )
         return
 
@@ -320,6 +634,16 @@ def handle_telegram_message(chat_id, text):
 
     state = draft["state"]
     payload = draft["payload"]
+    if state == "conflict_confirmation":
+        answer = text.lower()
+        if answer in {"yes", "y", "save", "proceed", "continue"}:
+            finish_telegram_entry(chat_id, payload, confirmed=True)
+        elif answer in {"no", "n", "cancel", "stop"}:
+            clear_telegram_draft(chat_id)
+            telegram_send(chat_id, "Not saved. Send /new to add a different entry.")
+        else:
+            telegram_send(chat_id, "Please reply yes to save it or no to cancel.")
+        return
     if state == "section":
         section = telegram_section(text)
         if not section:
@@ -329,6 +653,7 @@ def handle_telegram_message(chat_id, text):
             "section": section,
             "entry_date": "",
             "entry_time": "",
+            "entry_end_time": "",
             "location": "",
             "notes": "",
             "reminder_count": 1,
@@ -357,16 +682,23 @@ def handle_telegram_message(chat_id, text):
             return
         payload["entry_date"] = text
         set_telegram_draft(chat_id, "time", payload)
-        telegram_send(chat_id, "What time? Use HH:MM, for example 18:30. Reply skip if there is no specific time.")
+        telegram_send(
+            chat_id,
+            "What time? Use HH:MM for a one-hour entry, or a range like "
+            "13:00-15:00 (or 1-3pm). Reply skip if there is no specific time.",
+        )
         return
     if state == "time":
         if text.lower() != "skip":
             try:
-                datetime.strptime(text, "%H:%M")
+                payload["entry_time"], payload["entry_end_time"] = parse_telegram_time_window(text)
             except ValueError:
-                telegram_send(chat_id, "Please use HH:MM, for example 18:30, or reply skip.")
+                telegram_send(
+                    chat_id,
+                    "Please use HH:MM for a one-hour entry, or a range like "
+                    "13:00-15:00 (or 1-3pm). Reply skip if there is no specific time.",
+                )
                 return
-            payload["entry_time"] = text
         if payload["section"] == "reminders" and not payload["entry_time"]:
             telegram_send(chat_id, "Reminders need a time. Please send it as HH:MM, for example 18:30.")
             return

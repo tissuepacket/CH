@@ -76,25 +76,54 @@ def format_utc_stamp(value: datetime | None = None) -> str:
     return stamp.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def parse_entry_datetime(entry: sqlite3.Row) -> tuple[date, datetime | None]:
+def entry_value(entry: sqlite3.Row, key: str, default: str = "") -> str:
+    """Read a column while remaining compatible with older databases."""
+
+    try:
+        value = entry[key]
+    except (IndexError, KeyError):
+        return default
+    return default if value is None else value
+
+
+def parse_entry_datetimes(
+    entry: sqlite3.Row, duration_minutes: int
+) -> tuple[date, datetime | None, datetime | None]:
     entry_id = entry["id"]
     try:
-        entry_date = datetime.strptime(entry["entry_date"], "%Y-%m-%d").date()
+        entry_date = datetime.strptime(entry_value(entry, "entry_date"), "%Y-%m-%d").date()
     except (TypeError, ValueError) as error:
         raise CalendarExportError(
-            f"Entry {entry_id} has an invalid date: {entry['entry_date']!r}"
+            f"Entry {entry_id} has an invalid date: {entry_value(entry, 'entry_date')!r}"
         ) from error
 
-    if not entry["entry_time"]:
-        return entry_date, None
+    if not entry_value(entry, "entry_time"):
+        return entry_date, None, None
 
     try:
-        entry_time = datetime.strptime(entry["entry_time"], "%H:%M").time()
+        entry_time = datetime.strptime(entry_value(entry, "entry_time"), "%H:%M").time()
     except (TypeError, ValueError) as error:
         raise CalendarExportError(
-            f"Entry {entry_id} has an invalid time: {entry['entry_time']!r}"
+            f"Entry {entry_id} has an invalid time: {entry_value(entry, 'entry_time')!r}"
         ) from error
-    return entry_date, datetime.combine(entry_date, entry_time)
+
+    start = datetime.combine(entry_date, entry_time)
+    end_time_value = entry_value(entry, "entry_end_time")
+    if end_time_value:
+        try:
+            end_time = datetime.strptime(end_time_value, "%H:%M").time()
+        except (TypeError, ValueError) as error:
+            raise CalendarExportError(
+                f"Entry {entry_id} has an invalid end time: {end_time_value!r}"
+            ) from error
+        end = datetime.combine(entry_date, end_time)
+    else:
+        end = start + timedelta(minutes=duration_minutes)
+    if end <= start:
+        raise CalendarExportError(
+            f"Entry {entry_id} has an end time that is not after its start time"
+        )
+    return entry_date, start, end
 
 
 def recurrence_rule(entry: sqlite3.Row) -> str | None:
@@ -108,7 +137,7 @@ def recurrence_rule(entry: sqlite3.Row) -> str | None:
 
 
 def entry_lines(entry: sqlite3.Row, timezone_name: str, duration_minutes: int) -> list[str]:
-    entry_date, entry_datetime = parse_entry_datetime(entry)
+    entry_date, entry_datetime, end_datetime = parse_entry_datetimes(entry, duration_minutes)
     section = SECTION_LABELS.get(entry["section"], entry["section"] or "Daymark")
     title = str(entry["title"] or "Untitled entry")
 
@@ -137,7 +166,6 @@ def entry_lines(entry: sqlite3.Row, timezone_name: str, duration_minutes: int) -
             ]
         )
     else:
-        end_datetime = entry_datetime + timedelta(minutes=duration_minutes)
         start_value = entry_datetime.strftime("%Y%m%dT%H%M%S")
         end_value = end_datetime.strftime("%Y%m%dT%H%M%S")
         lines.extend(

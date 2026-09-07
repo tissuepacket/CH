@@ -5,6 +5,14 @@ Daymark SQLite database; it does not modify the Flask app.
 
 ## Create a Google Calendar import file
 
+When Daymark is running, the easiest option is to click **Export calendar**
+on the Daymark dashboard. Your browser downloads `daymark_calendar.ics`.
+
+You can also open the Daymark Telegram bot and send `/export`. The bot sends
+the same `.ics` file directly in Telegram.
+
+The command-line option remains available:
+
 From the `CH` folder, run:
 
 ```powershell
@@ -36,5 +44,8 @@ python calendar_import\export_calendar.py --duration-minutes 30
 3. Choose `calendar_import\daymark_calendar.ics`.
 4. Select the destination calendar and click **Import**.
 
-Google Calendar imports a snapshot of the entries. Run the exporter again and
-re-import the new file whenever the Daymark database changes.
+Google Calendar imports a snapshot of the entries; it is not a live connection.
+If an entry changes in Daymark, send `/export` again (or use the website's
+export button) and import the updated file. For clean updates, import into a
+separate `Daymark` calendar and replace that calendar's old events before
+importing the new snapshot.
