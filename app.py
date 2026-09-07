@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import calendar
 import json
 import os
 from pathlib import Path
@@ -209,7 +210,7 @@ def telegram_call(method, values=None):
         return None
 
 
-def telegram_send(chat_id, text, keyboard=None, remove_keyboard=False):
+def telegram_send(chat_id, text, keyboard=None, remove_keyboard=False, inline_keyboard=None):
     values = {"chat_id": chat_id, "text": text}
     if remove_keyboard:
         values["reply_markup"] = json.dumps({"remove_keyboard": True})
@@ -217,6 +218,8 @@ def telegram_send(chat_id, text, keyboard=None, remove_keyboard=False):
         values["reply_markup"] = json.dumps(
             {"keyboard": keyboard, "resize_keyboard": True, "one_time_keyboard": True}
         )
+    elif inline_keyboard:
+        values["reply_markup"] = json.dumps({"inline_keyboard": inline_keyboard})
     telegram_call("sendMessage", values)
 
 
@@ -242,6 +245,85 @@ def telegram_count_keyboard():
 
 def telegram_interval_keyboard():
     return [["30 minutes", "1 hour"], ["2 hours", "1 day"], ["1 week"]]
+
+
+def telegram_calendar_keyboard(year, month):
+    month_name = calendar.month_name[month]
+    keyboard = [[
+        {"text": "‹", "callback_data": f"calendar:{year}:{month - 1}"},
+        {"text": f"{month_name} {year}", "callback_data": "calendar:current"},
+        {"text": "›", "callback_data": f"calendar:{year}:{month + 1}"},
+    ]]
+    keyboard.append([
+        {"text": day, "callback_data": "calendar:current"}
+        for day in ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")
+    ])
+    for week in calendar.monthcalendar(year, month):
+        keyboard.append([
+            {"text": str(day) if day else " ", "callback_data": f"date:{year:04d}-{month:02d}-{day:02d}" if day else "calendar:current"}
+            for day in week
+        ])
+    return keyboard
+
+
+def telegram_send_date_prompt(chat_id, year=None, month=None):
+    today = datetime.now()
+    year = year or today.year
+    month = month or today.month
+    telegram_send(
+        chat_id,
+        "Choose the date from the calendar, or type it as YYYY-MM-DD.",
+        inline_keyboard=telegram_calendar_keyboard(year, month),
+    )
+
+
+def telegram_edit_calendar(chat_id, message_id, year, month):
+    telegram_call(
+        "editMessageText",
+        {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": "Choose the date from the calendar, or type it as YYYY-MM-DD.",
+            "reply_markup": json.dumps({"inline_keyboard": telegram_calendar_keyboard(year, month)}),
+        },
+    )
+
+
+def handle_telegram_callback(chat_id, callback_id, message_id, data):
+    telegram_call("answerCallbackQuery", {"callback_query_id": callback_id})
+    if data == "calendar:current":
+        return
+    if data.startswith("calendar:"):
+        _, year_text, month_text = data.split(":")
+        year, month = int(year_text), int(month_text)
+        if month == 0:
+            year, month = year - 1, 12
+        elif month == 13:
+            year, month = year + 1, 1
+        telegram_edit_calendar(chat_id, message_id, year, month)
+        return
+    if not data.startswith("date:"):
+        return
+    draft = get_telegram_draft(chat_id)
+    if not draft or draft["state"] != "date":
+        return
+    selected_date = data.removeprefix("date:")
+    try:
+        datetime.strptime(selected_date, "%Y-%m-%d")
+    except ValueError:
+        return
+    payload = draft["payload"]
+    payload["entry_date"] = selected_date
+    set_telegram_draft(chat_id, "time", payload)
+    telegram_call(
+        "editMessageText",
+        {"chat_id": chat_id, "message_id": message_id, "text": f"Date selected: {selected_date}"},
+    )
+    telegram_send(
+        chat_id,
+        "Choose a time. Scroll through the buttons to find the 30-minute slot you want.",
+        telegram_time_keyboard(payload["section"] != "reminders"),
+    )
 
 
 def get_telegram_draft(chat_id):
@@ -373,7 +455,7 @@ def handle_telegram_message(chat_id, text):
         if initial_text:
             payload["title"] = initial_text
             set_telegram_draft(chat_id, "date", payload)
-            telegram_send(chat_id, "What date? Use YYYY-MM-DD, for example 2026-09-07.")
+            telegram_send_date_prompt(chat_id)
         else:
             set_telegram_draft(chat_id, "title", payload)
             telegram_send(chat_id, "What should I remember? Send a short title.")
@@ -381,7 +463,7 @@ def handle_telegram_message(chat_id, text):
     if state == "title":
         payload["title"] = text
         set_telegram_draft(chat_id, "date", payload)
-        telegram_send(chat_id, "What date? Use YYYY-MM-DD, for example 2026-09-07.")
+        telegram_send_date_prompt(chat_id)
         return
     if state == "date":
         try:
@@ -531,6 +613,17 @@ def telegram_worker():
                     text = message.get("text", "")
                     if text:
                         handle_telegram_message(chat_id, text)
+                callback = update.get("callback_query")
+                if callback:
+                    callback_message = callback.get("message", {})
+                    callback_chat_id = callback_message.get("chat", {}).get("id")
+                    if callback_chat_id is not None:
+                        handle_telegram_callback(
+                            callback_chat_id,
+                            callback.get("id", ""),
+                            callback_message.get("message_id"),
+                            callback.get("data", ""),
+                        )
 
         with get_db() as connection:
             entries = connection.execute(
