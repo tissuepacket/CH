@@ -1,0 +1,9 @@
+{
+  "name": "Daymark",
+  "short_name": "Daymark",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f0e8",
+  "theme_color": "#f4f0e8",
+  "description": "Daymark life admin dashboard"
+}
