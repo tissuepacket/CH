@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -431,6 +431,21 @@ def reminder_occurrence(entry, now):
     return number, start + (number - 1) * step
 
 
+def event_notification(entry, now):
+    if entry["section"] == "reminders" or not entry["entry_date"] or not entry["entry_time"]:
+        return None
+    event_time = datetime.strptime(
+        f"{entry['entry_date']}T{entry['entry_time']}", "%Y-%m-%dT%H:%M"
+    )
+    notification_time = event_time.replace(hour=12, minute=0, second=0, microsecond=0)
+    notification_time -= timedelta(days=1)
+    notification_timestamp = notification_time.timestamp()
+    event_timestamp = event_time.timestamp()
+    if now >= notification_timestamp and now < event_timestamp:
+        return notification_timestamp
+    return None
+
+
 def telegram_worker():
     offset = None
     while True:
@@ -454,15 +469,23 @@ def telegram_worker():
 
         with get_db() as connection:
             entries = connection.execute(
-                "SELECT * FROM entries WHERE section = 'reminders' AND entry_time != '' AND reminder_interval > 0"
+                "SELECT * FROM entries WHERE entry_date != '' AND entry_time != ''"
             ).fetchall()
             chats = [row[0] for row in connection.execute("SELECT chat_id FROM telegram_chats")]
             for entry in entries:
-                occurrence = reminder_occurrence(entry, time.time())
-                if not occurrence:
-                    continue
-                reminder_number, occurrence_time = occurrence
-                occurrence_key = str(int(occurrence_time))
+                if entry["section"] == "reminders":
+                    occurrence = reminder_occurrence(entry, time.time())
+                    if not occurrence:
+                        continue
+                    reminder_number, occurrence_time = occurrence
+                    occurrence_key = str(int(occurrence_time))
+                    text = f"Daymark reminder\n{entry['title']}\nReminder {reminder_number} of {entry['reminder_count']}"
+                else:
+                    occurrence_time = event_notification(entry, time.time())
+                    if occurrence_time is None:
+                        continue
+                    occurrence_key = f"event:{int(occurrence_time)}"
+                    text = f"Daymark upcoming {entry['section']}\n{entry['title']}\nTomorrow at {entry['entry_time']}"
                 for chat_id in chats:
                     already_sent = connection.execute(
                         "SELECT 1 FROM telegram_sent WHERE chat_id = ? AND entry_id = ? AND occurrence = ?",
@@ -470,7 +493,6 @@ def telegram_worker():
                     ).fetchone()
                     if already_sent:
                         continue
-                    text = f"Daymark reminder\n{entry['title']}\nReminder {reminder_number} of {entry['reminder_count']}"
                     if entry["location"]:
                         text += f"\nLocation: {entry['location']}"
                     if telegram_call("sendMessage", {"chat_id": chat_id, "text": text}):
