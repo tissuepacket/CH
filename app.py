@@ -73,6 +73,9 @@ def init_db():
         connection.execute(
             "CREATE TABLE IF NOT EXISTS telegram_drafts (chat_id TEXT PRIMARY KEY, state TEXT NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL)"
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS telegram_updates (update_id INTEGER PRIMARY KEY, processed_at TEXT NOT NULL)"
+        )
         columns = {row[1] for row in connection.execute("PRAGMA table_info(entries)")}
         migrations = {
             "entry_end_time": "ALTER TABLE entries ADD COLUMN entry_end_time TEXT",
@@ -270,7 +273,7 @@ def telegram_call(method, values=None):
     endpoint = f"https://api.telegram.org/bot{token}/{method}"
     payload = parse.urlencode(values or {}).encode()
     try:
-with urllib_request.urlopen(
+        with urllib_request.urlopen(
             urllib_request.Request(endpoint, data=payload),
             timeout=35,
             context=get_telegram_ssl_context(),
@@ -295,7 +298,11 @@ def telegram_send(chat_id, text, keyboard=None, remove_keyboard=False, inline_ke
 
 
 def telegram_section_keyboard():
-    return [["Timetable", "Exams"], ["Important events", "Reminder notes"]]
+    return [
+        ["Timetable", "Exams"],
+        ["Important events", "Reminder notes"],
+        ["Export calendar"],
+    ]
 
 
 def telegram_yes_no_keyboard():
@@ -316,6 +323,10 @@ def telegram_count_keyboard():
 
 def telegram_interval_keyboard():
     return [["30 minutes", "1 hour"], ["2 hours", "1 day"], ["1 week"]]
+
+
+def telegram_export_keyboard():
+    return [[{"text": "Export to Google Calendar", "callback_data": "export_calendar"}]]
 
 
 def telegram_calendar_keyboard(year, month):
@@ -348,6 +359,22 @@ def telegram_send_date_prompt(chat_id, year=None, month=None):
     )
 
 
+def telegram_send_time_start_prompt(chat_id, section):
+    telegram_send(
+        chat_id,
+        "What time does it start? Choose a time, or choose No specific time.",
+        telegram_time_keyboard(section != "reminders"),
+    )
+
+
+def telegram_send_time_end_prompt(chat_id):
+    telegram_send(
+        chat_id,
+        "What time does it end? Choose an end time after the start time.",
+        telegram_time_keyboard(),
+    )
+
+
 def telegram_edit_calendar(chat_id, message_id, year, month):
     telegram_call(
         "editMessageText",
@@ -362,6 +389,9 @@ def telegram_edit_calendar(chat_id, message_id, year, month):
 
 def handle_telegram_callback(chat_id, callback_id, message_id, data):
     telegram_call("answerCallbackQuery", {"callback_query_id": callback_id})
+    if data == "export_calendar":
+        telegram_export_calendar(chat_id)
+        return
     if data == "calendar:current":
         return
     if data.startswith("calendar:"):
@@ -385,16 +415,12 @@ def handle_telegram_callback(chat_id, callback_id, message_id, data):
         return
     payload = draft["payload"]
     payload["entry_date"] = selected_date
-    set_telegram_draft(chat_id, "time", payload)
+    set_telegram_draft(chat_id, "time_start", payload)
     telegram_call(
         "editMessageText",
         {"chat_id": chat_id, "message_id": message_id, "text": f"Date selected: {selected_date}"},
     )
-    telegram_send(
-        chat_id,
-        "Choose a time. Scroll through the buttons to find the 30-minute slot you want.",
-        telegram_time_keyboard(payload["section"] != "reminders"),
-    )
+    telegram_send_time_start_prompt(chat_id, payload["section"])
 
 
 def telegram_send_document(chat_id, content, filename, caption=""):
@@ -711,12 +737,17 @@ def finish_telegram_entry(chat_id, payload, confirmed=False):
         "Send /new to add another entry.",
         remove_keyboard=True,
     )
+    telegram_send(
+        chat_id,
+        "Export your current Daymark calendar:",
+        inline_keyboard=telegram_export_keyboard(),
+    )
 
 
 def handle_telegram_message(chat_id, text):
     text = text.strip()
     command = text.split()[0].lower().split("@", 1)[0] if text else ""
-    if command in {"/export", "/calendar"}:
+    if command in {"/export", "/calendar", "export"} or text.lower() == "export calendar":
         telegram_export_calendar(chat_id)
         return
     if command == "/help":
@@ -726,6 +757,7 @@ def handle_telegram_message(chat_id, text):
             "/new - add a task\n"
             "/export - receive the current calendar file for Google Calendar\n"
             "/cancel - cancel the current entry",
+            inline_keyboard=telegram_export_keyboard(),
         )
         return
     if command in {"/cancel", "/stop"}:
@@ -796,26 +828,69 @@ def handle_telegram_message(chat_id, text):
             telegram_send(chat_id, "Please use the date format YYYY-MM-DD, for example 2026-09-07.")
             return
         payload["entry_date"] = text
-        set_telegram_draft(chat_id, "time", payload)
-        telegram_send(
-            chat_id,
-"What time? Use HH:MM for a one-hour entry, or a range like 13:00-15:00 (or 1-3pm). Reply skip if there is no specific time.\n\nChoose a time. Scroll through the buttons to find the 30-minute slot you want.",
-            telegram_time_keyboard(payload["section"] != "reminders"),
-        )
+        set_telegram_draft(chat_id, "time_start", payload)
+        telegram_send_time_start_prompt(chat_id, payload["section"])
         return
-    if state == "time":
+    if state == "time_start":
         if text.lower() == "no specific time":
             payload["entry_time"] = ""
+            payload["entry_end_time"] = ""
+        else:
+            try:
+                if "-" in text:
+                    payload["entry_time"], payload["entry_end_time"] = parse_telegram_time_window(text)
+                else:
+                    payload["entry_time"] = parse_time_token(text).strftime("%H:%M")
+                    payload["entry_end_time"] = ""
+            except ValueError:
+                telegram_send(
+                    chat_id,
+                    "Please choose a start time, or type it as HH:MM (for example 13:00).",
+                    telegram_time_keyboard(payload["section"] != "reminders"),
+                )
+                return
+            if not payload["entry_end_time"]:
+                set_telegram_draft(chat_id, "time_end", payload)
+                telegram_send_time_end_prompt(chat_id)
+                return
+        if payload["section"] == "reminders" and not payload["entry_time"]:
+            telegram_send(chat_id, "Reminder notes need a start time. Please choose a time.", telegram_time_keyboard())
+            return
+        set_telegram_draft(chat_id, "location_choice", payload)
+        telegram_send(chat_id, "Does it have a location?", telegram_yes_no_keyboard())
+        return
+    if state == "time_end":
+        try:
+            end_time = parse_time_token(text)
+            start_time = datetime.strptime(payload["entry_time"], "%H:%M").time()
+            if end_time <= start_time:
+                raise ValueError
+            payload["entry_end_time"] = end_time.strftime("%H:%M")
+        except ValueError:
+            telegram_send(
+                chat_id,
+                "Please choose an end time after the start time.",
+                telegram_time_keyboard(),
+            )
+            return
+        set_telegram_draft(chat_id, "location_choice", payload)
+        telegram_send(chat_id, "Does it have a location?", telegram_yes_no_keyboard())
+        return
+    if state == "time":
+        # Compatibility for drafts created before the start/end time flow.
+        if text.lower() == "no specific time":
+            payload["entry_time"] = ""
+            payload["entry_end_time"] = ""
         else:
             try:
                 payload["entry_time"], payload["entry_end_time"] = parse_telegram_time_window(text)
             except ValueError:
-telegram_send(
+                telegram_send(
                 chat_id,
                 "Please use HH:MM for a one-hour entry, or a range like "
                 "13:00-15:00 (or 1-3pm). Reply skip if there is no specific time.",
                 telegram_time_keyboard(payload["section"] != "reminders"),
-            )
+                )
                 return
         if payload["section"] == "reminders" and not payload["entry_time"]:
             telegram_send(chat_id, "Reminder notes need a time. Please choose a time button.", telegram_time_keyboard())
@@ -928,6 +1003,14 @@ def telegram_worker():
         if updates and updates.get("ok"):
             for update in updates.get("result", []):
                 offset = update["update_id"] + 1
+                with get_db() as connection:
+                    claimed = connection.execute(
+                        "INSERT OR IGNORE INTO telegram_updates (update_id, processed_at) VALUES (?, ?)",
+                        (update["update_id"], datetime.now().isoformat(timespec="seconds")),
+                    ).rowcount
+                    connection.commit()
+                if not claimed:
+                    continue
                 message = update.get("message", {})
                 chat = message.get("chat", {})
                 chat_id = chat.get("id")
