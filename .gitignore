@@ -1,5 +1,4 @@
 .venv/
-.venv-1/
 .env
 life_admin.db
 __pycache__/
