@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f0e8">
+  <title>Daymark · Life admin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="notification-stack" data-notification-stack aria-live="polite"></div>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="{{ url_for('dashboard') }}"><span class="brand-mark">✳</span><span>daymark</span></a>
+      <div class="topbar-meta"><span class="status-dot"></span><span>personal command centre</span></div>
+    </header>
+
+    <section class="intro">
+      <div>
+        <p class="eyebrow">{{ today }} <span>/</span> keep the small things moving</p>
+        <h1>Your life,<br><em>in one place.</em></h1>
+      </div>
+      <p class="intro-note">A calm corner for the things<br class="desktop-only"> you need to remember.</p>
+    </section>
+
+    <section class="workspace">
+      <aside class="section-nav">
+        <div class="nav-heading"><span>Sections</span><span class="count">{{ entries|length }}</span></div>
+        <a class="section-link {% if selected == 'all' %}active{% endif %}" href="{{ url_for('dashboard') }}"><span class="section-icon all">◎</span><span>Everything</span><span class="arrow">↗</span></a>
+        {% for key, section in sections.items() %}
+        <a class="section-link {% if selected == key %}active{% endif %}" href="{{ url_for('dashboard', section=key) }}"><span class="section-icon {{ section.color }}">{{ section.icon }}</span><span>{{ section.label }}</span><span class="arrow">↗</span></a>
+        {% endfor %}
+        <div class="nav-foot">Tip: open this page<br>from your Telegram bot.</div>
+      </aside>
+
+      <div class="content">
+        <div class="content-head">
+          <div><p class="eyebrow">{% if view == 'completed' %}Completed{% else %}Overview{% endif %}</p><h2>{% if view == 'completed' %}Finished reminders{% elif selected == 'all' %}All your things{% else %}{{ sections[selected].label }}{% endif %}</h2></div>
+          <button class="add-button" type="button" data-open-form><span>＋</span> Add entry</button>
+        </div>
+
+        <div class="entries">
+          {% if entries %}
+            {% for entry in entries %}
+            <article class="entry entry-{{ entry.section_color }}" data-entry-id="{{ entry.id }}">
+              <div class="entry-date"><strong>{{ entry.display_date.split(',')[0] }}</strong><span>{{ entry.display_date.split(',')[1] if ',' in entry.display_date else '' }}</span></div>
+              <div class="entry-main"><div class="entry-kicker"><span class="mini-dot"></span>{{ entry.section_label }}</div><h3>{{ entry.title }}</h3>{% if entry.notes %}<p>{{ entry.notes }}</p>{% endif %}</div>
+              <div class="entry-detail">{% if entry.entry_time %}<span>◷ {{ entry.entry_time }}</span>{% endif %}{% if entry.location %}<span>⌖ {{ entry.location }}</span>{% endif %}{% if entry.schedule_label %}<span>↻ {{ entry.schedule_label }}</span>{% endif %}</div>
+              <form method="post" action="{{ url_for('delete_entry', entry_id=entry.id) }}"><button class="delete-button" title="Delete entry" aria-label="Delete {{ entry.title }}">×</button></form>
+            </article>
+            {% endfor %}
+          {% else %}
+            <div class="empty-state"><span class="empty-symbol">✳</span><h3>Nothing here yet.</h3><p>Add the first thing you want to keep in view.</p><button class="text-button" type="button" data-open-form>Add your first entry <span>↗</span></button></div>
+          {% endif %}
+        </div>
+        {% if completed_count and view != 'completed' %}<a class="completed-link" href="{{ url_for('dashboard', view='completed') }}">{{ completed_count }} completed reminder{% if completed_count != 1 %}s{% endif %} <span>↗</span></a>{% endif %}
+      </div>
+    </section>
+
+    <footer><span>DAYMARK / LIFE ADMIN</span><span>stored locally on this device</span></footer>
+  </main>
+
+  <div class="modal-backdrop" data-modal>
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="form-title">
+      <button class="close-button" type="button" data-close-form aria-label="Close">×</button>
+      <p class="eyebrow">New entry</p><h2 id="form-title">Put it somewhere<br><em>you'll find it.</em></h2>
+      <form class="entry-form" method="post" action="{{ url_for('create_entry') }}">
+        <label>Section<select name="section" required>{% for key, section in sections.items() %}<option value="{{ key }}" {% if selected == key %}selected{% endif %}>{{ section.label }}</option>{% endfor %}</select></label>
+        <label>What is it?<input name="title" required autofocus placeholder="e.g. submit project outline"></label>
+        <div class="form-row"><label>Date<input type="date" name="entry_date" required></label><label>Time <span class="optional">optional</span><input type="time" name="entry_time"></label></div>
+        <label>Location <span class="optional">optional</span><input name="location" placeholder="e.g. Library, Room 204"></label>
+        <label>Notes <span class="optional">optional</span><textarea name="notes" rows="3" placeholder="Anything else worth keeping close?"></textarea></label>
+        <div class="reminder-options" data-reminder-options>
+          <div class="form-section-label">Reminder schedule</div>
+          <div class="form-row"><label>Number of reminders<input type="number" name="reminder_count" min="1" max="100" value="1"></label><label>Send every <span class="optional">interval</span><div class="interval-input"><input type="number" name="reminder_interval" min="1" max="100000" value="1"><select name="reminder_interval_unit"><option value="minutes">minutes</option><option value="hours" selected>hours</option><option value="days">days</option><option value="weeks">weeks</option></select></div></label></div>
+        </div>
+        <button class="submit-button" type="submit">Save entry <span>↗</span></button>
+      </form>
+    </section>
+  </div>
+  <script>
+    const modal = document.querySelector('[data-modal]');
+    const openButtons = document.querySelectorAll('[data-open-form]');
+    const closeButton = document.querySelector('[data-close-form]');
+    const sectionSelect = document.querySelector('select[name=section]');
+    const reminderOptions = document.querySelector('[data-reminder-options]');
+    const updateReminderOptions = () => { reminderOptions.classList.toggle('is-visible', sectionSelect.value === 'reminders'); };
+    const openModal = () => { modal.classList.add('is-open'); document.body.classList.add('modal-open'); setTimeout(() => modal.querySelector('input[name=title]').focus(), 100); };
+    const closeModal = () => { modal.classList.remove('is-open'); document.body.classList.remove('modal-open'); };
+    openButtons.forEach(button => button.addEventListener('click', openModal));
+    closeButton.addEventListener('click', closeModal);
+    sectionSelect.addEventListener('change', updateReminderOptions);
+    updateReminderOptions();
+    modal.addEventListener('click', event => { if (event.target === modal) closeModal(); });
+    document.addEventListener('keydown', event => { if (event.key === 'Escape') closeModal(); });
+
+    const notificationStack = document.querySelector('[data-notification-stack]');
+    const notificationStorageKey = 'daymark-notifications-seen';
+    const seenNotifications = new Set(JSON.parse(localStorage.getItem(notificationStorageKey) || '[]'));
+    const intervalMilliseconds = { minutes: 60000, hours: 3600000, days: 86400000, weeks: 604800000 };
+    const reminderTimers = new Map();
+
+    const showReminderNotification = (entry, occurrence, reminderNumber) => {
+      const notificationKey = `${entry.id}:${occurrence}`;
+      if (seenNotifications.has(notificationKey)) return;
+      seenNotifications.add(notificationKey);
+      localStorage.setItem(notificationStorageKey, JSON.stringify([...seenNotifications].slice(-200)));
+
+      const banner = document.createElement('article');
+      banner.className = 'notification-banner';
+      banner.innerHTML = `<div class="notification-icon">!</div><div class="notification-copy"><strong>Daymark reminder</strong><span>${entry.title}</span><small>Reminder ${reminderNumber} of ${entry.reminder_count}${entry.location ? ` · ${entry.location}` : ''}</small></div><button type="button" aria-label="Dismiss notification">×</button>`;
+      banner.querySelector('button').addEventListener('click', () => banner.remove());
+      notificationStack.appendChild(banner);
+      setTimeout(() => banner.remove(), 10000);
+    };
+
+    const scheduleReminder = (entry, occurrence, reminderNumber) => {
+      const key = `${entry.id}:${occurrence}`;
+      if (seenNotifications.has(key) || reminderTimers.has(key)) return;
+      const delay = Math.max(0, occurrence - Date.now());
+      const timer = setTimeout(() => {
+        reminderTimers.delete(key);
+        showReminderNotification(entry, occurrence, reminderNumber);
+      }, delay);
+      reminderTimers.set(key, timer);
+    };
+
+    const scheduleEntries = entries => {
+      const now = Date.now();
+      entries.filter(entry => entry.section === 'reminders' && entry.entry_time && entry.reminder_interval > 0).forEach(entry => {
+        const start = new Date(`${entry.entry_date}T${entry.entry_time}`).getTime();
+        const step = entry.reminder_interval * intervalMilliseconds[entry.reminder_interval_unit];
+        if (!Number.isFinite(start) || !step) return;
+        for (let reminderNumber = 1; reminderNumber <= entry.reminder_count; reminderNumber += 1) {
+          const occurrence = start + (reminderNumber - 1) * step;
+          if (occurrence >= now) scheduleReminder(entry, occurrence, reminderNumber);
+        }
+        if (start < now) {
+          const currentNumber = Math.min(entry.reminder_count, Math.floor((now - start) / step) + 1);
+          const currentOccurrence = start + (currentNumber - 1) * step;
+          if (currentNumber <= entry.reminder_count && now - currentOccurrence < 15 * 60 * 1000) {
+            showReminderNotification(entry, currentOccurrence, currentNumber);
+          }
+        }
+      });
+    };
+
+    const checkReminders = async () => {
+      try {
+        const entries = await fetch('/api/entries', { cache: 'no-store' }).then(response => response.json());
+        scheduleEntries(entries);
+      } catch (error) {
+      }
+    };
+    checkReminders();
+    setInterval(checkReminders, 15000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) checkReminders(); });
+  </script>
+</body>
+</html>
