@@ -42,6 +42,7 @@
       <div class="content">
         <div class="content-head">
           <div><p class="eyebrow">{% if view == 'completed' %}Completed{% else %}Overview{% endif %}</p><h2>{% if view == 'completed' %}Finished reminders{% elif selected == 'all' %}All your things{% else %}{{ sections[selected].label }}{% endif %}</h2></div>
+          <a class="add-button calendar-button" style="text-decoration:none;background:var(--teal)" href="{{ url_for('download_calendar') }}"><span>Export</span> calendar</a>
           <button class="add-button" type="button" data-open-form><span>＋</span> Add entry</button>
         </div>
 
@@ -51,7 +52,7 @@
             <article class="entry entry-{{ entry.section_color }}" data-entry-id="{{ entry.id }}">
               <div class="entry-date"><strong>{{ entry.display_date.split(',')[0] }}</strong><span>{{ entry.display_date.split(',')[1] if ',' in entry.display_date else '' }}</span></div>
               <div class="entry-main"><div class="entry-kicker"><span class="mini-dot"></span>{{ entry.section_label }}</div><h3>{{ entry.title }}</h3>{% if entry.notes %}<p>{{ entry.notes }}</p>{% endif %}</div>
-              <div class="entry-detail">{% if entry.entry_time %}<span>◷ {{ entry.entry_time }}</span>{% endif %}{% if entry.location %}<span>⌖ {{ entry.location }}</span>{% endif %}{% if entry.schedule_label %}<span>↻ {{ entry.schedule_label }}</span>{% endif %}</div>
+              <div class="entry-detail">{% if entry.display_time %}<span>◷ {{ entry.display_time }}</span>{% endif %}{% if entry.location %}<span>⌖ {{ entry.location }}</span>{% endif %}{% if entry.schedule_label %}<span>↻ {{ entry.schedule_label }}</span>{% endif %}</div>
               <form method="post" action="{{ url_for('delete_entry', entry_id=entry.id) }}"><button class="delete-button" title="Delete entry" aria-label="Delete {{ entry.title }}">×</button></form>
             </article>
             {% endfor %}
@@ -73,7 +74,8 @@
       <form class="entry-form" method="post" action="{{ url_for('create_entry') }}">
         <label>Section<select name="section" required>{% for key, section in sections.items() %}<option value="{{ key }}" {% if selected == key %}selected{% endif %}>{{ section.label }}</option>{% endfor %}</select></label>
         <label>What is it?<input name="title" required autofocus placeholder="e.g. submit project outline"></label>
-        <div class="form-row"><label>Date<input type="date" name="entry_date" required></label><label>Time <span class="optional">optional</span><input type="time" name="entry_time"></label></div>
+        <div class="form-row"><label>Date<input type="date" name="entry_date" required></label><label>Start time <span class="optional">optional</span><input type="time" name="entry_time"></label></div>
+        <label>End time <span class="optional">optional; defaults to 1 hour after start</span><input type="time" name="entry_end_time"></label>
         <label>Location <span class="optional">optional</span><input name="location" placeholder="e.g. Library, Room 204"></label>
         <label>Notes <span class="optional">optional</span><textarea name="notes" rows="3" placeholder="Anything else worth keeping close?"></textarea></label>
         <div class="reminder-options" data-reminder-options>
